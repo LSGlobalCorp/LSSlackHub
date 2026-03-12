@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS agent_activities (
 CREATE INDEX IF NOT EXISTS idx_agent_activities_workspace ON agent_activities(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_agent_activities_agent ON agent_activities(agent_slack_id);
 CREATE INDEX IF NOT EXISTS idx_agent_activities_created ON agent_activities(created_at);
-CREATE INDEX IF NOT EXISTS idx_agent_activities_date ON agent_activities((created_at::date));
+CREATE INDEX IF NOT EXISTS idx_agent_activities_date ON agent_activities(date(created_at AT TIME ZONE 'UTC'));
 
 -- Google OAuth tokens for Sheets integration
 CREATE TABLE IF NOT EXISTS google_auth (
