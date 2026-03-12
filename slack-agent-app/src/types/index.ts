@@ -86,3 +86,62 @@ export interface TallyResult {
   entries: TallyEntry[];
   total_responses: number;
 }
+
+export type ActionType = 'answer' | 'transfer' | 'escalation' | 'hold' | 'other';
+
+export interface AgentActivity {
+  id: string;
+  workspace_id: string;
+  agent_slack_id: string;
+  action_type: ActionType;
+  channel_slack_id: string;
+  customer_context: string | null;
+  notes: string | null;
+  raw_message: string;
+  message_ts: string;
+  confidence: number;
+  created_at: Date;
+}
+
+export interface ClassificationResult {
+  isAgentActivity: boolean;
+  actionType?: ActionType;
+  customerContext?: string;
+  notes?: string;
+  confidence: number;
+}
+
+export interface GoogleAuth {
+  id: string;
+  workspace_id: string;
+  encrypted_access_token: string;
+  encrypted_refresh_token: string;
+  sheet_id: string | null;
+  token_expiry: Date;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface DailyAgentStats {
+  agent_slack_id: string;
+  display_name: string;
+  total: number;
+  answers: number;
+  transfers: number;
+  escalations: number;
+  holds: number;
+  other: number;
+  top_channel: string;
+}
+
+export interface DailyReportData {
+  date: string;
+  workspace_id: string;
+  total_actions: number;
+  answers: number;
+  transfers: number;
+  escalations: number;
+  holds: number;
+  other: number;
+  agents: DailyAgentStats[];
+}
