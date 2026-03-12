@@ -1,9 +1,11 @@
 import { Request, Response } from "express";
+import { WebClient } from "@slack/web-api";
 import { handleGoogleCallback } from "../services/google-sheets";
+import { getDecryptedToken } from "../services/workspace";
 import { logger } from "../utils/logger";
 
 export async function handleGoogleOAuthCallback(req: Request, res: Response): Promise<void> {
-  const { code, state: teamId, error } = req.query as Record<string, string>;
+  const { code, state, error } = req.query as Record<string, string>;
 
   if (error) {
     logger.warn("Google OAuth denied", { error });
@@ -11,13 +13,35 @@ export async function handleGoogleOAuthCallback(req: Request, res: Response): Pr
     return;
   }
 
-  if (!code || !teamId) {
+  if (!code || !state) {
     res.status(400).send(page("Error", "Missing authorization code or workspace ID.", true));
     return;
   }
 
+  // Parse state: "teamId" or "teamId:channelId"
+  const [teamId, channelId] = state.split(":");
+
   try {
     const sheetId = await handleGoogleCallback(code, teamId);
+
+    // Send confirmation to Slack
+    if (channelId) {
+      try {
+        const token = await getDecryptedToken(teamId);
+        if (token) {
+          const client = new WebClient(token);
+          await client.chat.postMessage({
+            channel: channelId,
+            text: `:white_check_mark: *Google Sheets connected!*\n\nA spreadsheet has been created to track agent activity.\n<https://docs.google.com/spreadsheets/d/${sheetId}|Open Google Sheet>`,
+          });
+        }
+      } catch (slackErr) {
+        logger.warn("Failed to send Sheets confirmation to Slack", {
+          error: slackErr instanceof Error ? slackErr.message : "Unknown",
+        });
+      }
+    }
+
     res.send(page(
       "Google Sheets Connected!",
       `Your Google Sheet has been created and linked. <br><a href="https://docs.google.com/spreadsheets/d/${sheetId}" target="_blank">Open Sheet</a>`

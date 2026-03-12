@@ -3,9 +3,9 @@ import { WebClient } from "@slack/web-api";
 import { handleAgentRespond } from "./services/agent-responder";
 import { getTally, formatTallyBlocks, generateCsvExport } from "./services/tally";
 import { syncAll } from "./services/data-sync";
-import { shouldClassify, handleMessage } from "./services/message-interpreter";
+import { shouldProcess, runParsers, cleanMessage } from "./parsers";
 import { getWorkspaceByTeamId, getDecryptedToken } from "./services/workspace";
-import { getAuthUrl, appendActivityRow, disconnectSheets } from "./services/google-sheets";
+import { getAuthUrl, disconnectSheets, setSheetId } from "./services/google-sheets";
 import { generateDailyReport, aggregateDailyData } from "./services/daily-report";
 import { query } from "./db/client";
 import { logger } from "./utils/logger";
@@ -178,12 +178,11 @@ export function createApp(): App {
     }
   });
 
-  // Message listener — classify agent activity
-  app.message(async ({ message, context }) => {
+  // Message listener — run through parser registry
+  app.message(async ({ message, context, client }) => {
     const msg = message as any;
 
-    const botUserId = context.botUserId;
-    if (!shouldClassify(msg, botUserId)) return;
+    if (!shouldProcess(msg, context.botUserId)) return;
 
     const teamId = (context as any).teamId || msg.team;
     if (!teamId) return;
@@ -192,38 +191,47 @@ export function createApp(): App {
       const workspace = await getWorkspaceByTeamId(teamId);
       if (!workspace) return;
 
+      // Resolve channel name
+      let channelName: string;
       const channelResult = await query(
         "SELECT name FROM channels WHERE workspace_id = $1 AND slack_channel_id = $2",
         [workspace.id, msg.channel]
       );
-      const channelName = channelResult.rows[0]?.name || msg.channel;
+      if (channelResult.rows[0]?.name) {
+        channelName = channelResult.rows[0].name;
+      } else {
+        try {
+          const info = await client.conversations.info({ channel: msg.channel });
+          channelName = (info.channel as any)?.name || msg.channel;
+        } catch {
+          channelName = msg.channel;
+        }
+      }
 
-      const result = await handleMessage(
-        teamId, msg.channel, msg.user, msg.text || "",
-        msg.ts, channelName, channelName, workspace.id
-      );
+      // Run through parser registry
+      const result = await runParsers({
+        text: cleanMessage(msg.text || ""),
+        senderId: msg.user,
+        channelId: msg.channel,
+        channelName: `${channelName} (${msg.channel})`,
+        workspaceId: workspace.id,
+        messageTs: msg.ts,
+      });
 
-      if (result.stored && result.activity) {
-        const userResult = await query(
-          "SELECT display_name FROM users WHERE workspace_id = $1 AND slack_user_id = $2",
-          [workspace.id, msg.user]
-        );
-        const agentName = userResult.rows[0]?.display_name || msg.user;
-        const now = new Date();
-
-        appendActivityRow(workspace.id, {
-          date: now.toISOString().split("T")[0],
-          time: now.toTimeString().split(" ")[0],
-          agentName,
-          actionType: result.activity.actionType,
-          channelName,
-          customerContext: result.activity.customerContext,
-          notes: result.activity.notes,
-          confidence: result.activity.confidence,
-        });
+      // React if parser matched
+      if (result.matched && result.reaction) {
+        try {
+          await client.reactions.add({
+            channel: msg.channel,
+            timestamp: msg.ts,
+            name: result.reaction,
+          });
+        } catch {
+          logger.debug("Failed to add reaction", { channel: msg.channel, ts: msg.ts });
+        }
       }
     } catch (err) {
-      logger.error("Error in message classifier", {
+      logger.error("Error in message parser", {
         error: err instanceof Error ? err.message : "Unknown",
         channel: msg.channel,
       });
@@ -233,10 +241,10 @@ export function createApp(): App {
   // /connect-sheets command
   app.command("/connect-sheets", async ({ command, ack, respond }: SlackCommandMiddlewareArgs) => {
     await ack();
-    const { team_id } = command;
+    const { team_id, channel_id } = command;
 
     try {
-      const url = getAuthUrl(team_id);
+      const url = getAuthUrl(team_id, channel_id);
       await respond({
         response_type: "ephemeral",
         text: `Click here to connect Google Sheets: ${url}\n\nThis will create a new spreadsheet to track agent activity.`,
@@ -244,6 +252,43 @@ export function createApp(): App {
     } catch (err) {
       logger.error("Error in /connect-sheets", { error: err instanceof Error ? err.message : "Unknown" });
       await respond({ response_type: "ephemeral", text: "Failed to generate connection link. Please try again." });
+    }
+  });
+
+  // /set-sheet command — point to an existing Google Sheet
+  app.command("/set-sheet", async ({ command, ack, respond }: SlackCommandMiddlewareArgs) => {
+    await ack();
+    const { team_id, text } = command;
+
+    const sheetId = text.trim();
+    if (!sheetId) {
+      await respond({
+        response_type: "ephemeral",
+        text: "Usage: `/set-sheet <sheet-id>`\n\nYou can find the sheet ID in the URL: `https://docs.google.com/spreadsheets/d/<SHEET_ID>/edit`",
+      });
+      return;
+    }
+
+    try {
+      const workspace = await getWorkspaceByTeamId(team_id);
+      if (!workspace) {
+        await respond({ response_type: "ephemeral", text: "Workspace not found." });
+        return;
+      }
+
+      const updated = await setSheetId(workspace.id, sheetId);
+      if (!updated) {
+        await respond({ response_type: "ephemeral", text: "No Google Sheets connection found. Run `/connect-sheets` first to authenticate, then use `/set-sheet` to switch sheets." });
+        return;
+      }
+
+      await respond({
+        response_type: "in_channel",
+        text: `:white_check_mark: *Sheet updated!* Now logging to:\n<https://docs.google.com/spreadsheets/d/${sheetId}|Open Google Sheet>`,
+      });
+    } catch (err) {
+      logger.error("Error in /set-sheet", { error: err instanceof Error ? err.message : "Unknown" });
+      await respond({ response_type: "ephemeral", text: "Failed to update sheet. Please try again." });
     }
   });
 
@@ -259,7 +304,7 @@ export function createApp(): App {
         return;
       }
       await disconnectSheets(workspace.id);
-      await respond({ response_type: "ephemeral", text: "Google Sheets disconnected. The sheet itself was not deleted." });
+      await respond({ response_type: "in_channel", text: ":no_entry_sign: *Google Sheets disconnected.* The spreadsheet itself was not deleted — you can reconnect anytime with `/connect-sheets`." });
     } catch (err) {
       logger.error("Error in /disconnect-sheets", { error: err instanceof Error ? err.message : "Unknown" });
       await respond({ response_type: "ephemeral", text: "Failed to disconnect. Please try again." });

@@ -1,96 +1,83 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { query } from "../db/client";
 import { logger } from "../utils/logger";
-import { ClassificationResult } from "../types";
-
-let anthropicClient: Anthropic | null = null;
-
-function getAnthropicClient(): Anthropic {
-  if (!anthropicClient) {
-    anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  }
-  return anthropicClient;
-}
 
 interface SlackMessage {
   text: string;
   user?: string;
   bot_id?: string;
   subtype?: string;
-  thread_ts?: string;
 }
-
-const MINIMUM_WORD_COUNT = 5;
 
 export function shouldClassify(message: SlackMessage, botUserId?: string): boolean {
   if (message.bot_id) return false;
   if (message.subtype) return false;
   if (botUserId && message.user === botUserId) return false;
-  const wordCount = (message.text || "").trim().split(/\s+/).length;
-  if (wordCount < MINIMUM_WORD_COUNT) return false;
+  if (!message.text || message.text.trim().length === 0) return false;
   return true;
 }
 
-const CLASSIFICATION_SYSTEM_PROMPT = `You are a message classifier for a customer service team's Slack workspace.
-Your job is to determine if a Slack message is an agent reporting an action they took (answered a customer, transferred a call, escalated a ticket, put someone on hold, etc.) versus general chatter.
+// --- Pattern Parser ---
 
-Classify the message and respond with ONLY valid JSON (no markdown, no code fences):
-{
-  "isAgentActivity": boolean,
-  "actionType": "answer" | "transfer" | "escalation" | "hold" | "other",
-  "customerContext": "brief description of the customer/topic if applicable",
-  "notes": "any additional relevant details",
-  "confidence": 0.0 to 1.0
+export interface ParsedLog {
+  customerId: string;
+  answered: boolean;
+  transfer: boolean;
 }
 
-Action type definitions:
-- "answer": Agent answered/resolved a customer question or issue
-- "transfer": Agent transferred/handed off a customer to another team or agent
-- "escalation": Agent escalated an issue to senior support or management
-- "hold": Agent put a customer on hold
-- "other": Agent performed some other tracked activity
+const YES_VALUES = new Set(["yes", "y", "true", "1"]);
+const NO_VALUES = new Set(["no", "n", "false", "0"]);
 
-If the message is NOT agent activity (general chatter, greetings, scheduling, etc.), return:
-{ "isAgentActivity": false, "confidence": <your confidence it's NOT activity> }
-
-Be strict: only classify as agent activity when the message clearly describes an action taken with/for a customer.`;
-
-export async function classifyMessage(
-  messageText: string,
-  channelName: string,
-  channelTopic: string
-): Promise<ClassificationResult> {
-  const client = getAnthropicClient();
-
-  const userMessage = `Channel: #${channelName}
-Channel topic: ${channelTopic}
-
-Message: "${messageText}"`;
-
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 256,
-    system: CLASSIFICATION_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
-  });
-
-  const textBlock = response.content.find((block) => block.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    logger.warn("No text block in classification response");
-    return { isAgentActivity: false, confidence: 0 };
-  }
-
-  try {
-    const parsed = JSON.parse(textBlock.text) as ClassificationResult;
-    return parsed;
-  } catch (err) {
-    logger.error("Failed to parse classification response", {
-      response: textBlock.text,
-      error: err instanceof Error ? err.message : "Unknown",
-    });
-    return { isAgentActivity: false, confidence: 0 };
-  }
+function parseYesNo(value: string): boolean | null {
+  const v = value.toLowerCase().trim();
+  if (YES_VALUES.has(v)) return true;
+  if (NO_VALUES.has(v)) return false;
+  return null;
 }
+
+/**
+ * Parse agent log messages. Accepts formats like:
+ *   user 279 a yes t no
+ *   user 279 a:yes t:no
+ *   279 a yes t no
+ *   279 a y t n
+ */
+export function parseLogMessage(text: string): ParsedLog | null {
+  // Strip Slack mentions like <@U0AKYU7PYF7>
+  const cleaned = text.replace(/<@[A-Z0-9]+>/g, "").trim();
+
+  // Extract customer ID — with or without "user" prefix
+  const idMatch = cleaned.match(/^(?:user\s+)?(\S+)\s+(.+)$/i);
+  if (!idMatch) return null;
+
+  const customerId = idMatch[1];
+  const rest = idMatch[2].toLowerCase();
+
+  // Try colon format: a:yes t:no
+  const colonPattern = /\b(?:answered|answer|ans|a)\s*:\s*(\S+)\s+(?:transfer|trans|t)\s*:\s*(\S+)/i;
+  const colonMatch = rest.match(colonPattern);
+  if (colonMatch) {
+    const answered = parseYesNo(colonMatch[1]);
+    const transfer = parseYesNo(colonMatch[2]);
+    if (answered !== null && transfer !== null) {
+      return { customerId, answered, transfer };
+    }
+  }
+
+  // Try space format: a yes t no
+  const spacePattern = /\b(?:answered|answer|ans|a)\s+(\S+)\s+(?:transfer|trans|t)\s+(\S+)/i;
+  const spaceMatch = rest.match(spacePattern);
+  if (spaceMatch) {
+    const answered = parseYesNo(spaceMatch[1]);
+    const transfer = parseYesNo(spaceMatch[2]);
+    if (answered !== null && transfer !== null) {
+      return { customerId, answered, transfer };
+    }
+  }
+
+  return null;
+}
+
+// --- Storage ---
 
 interface StoreActivityParams {
   workspaceId: string;
@@ -120,7 +107,7 @@ export async function storeActivity(params: StoreActivityParams): Promise<void> 
   });
 }
 
-const CONFIDENCE_THRESHOLD = 0.7;
+// --- Main Handler ---
 
 export interface HandleMessageResult {
   stored: boolean;
@@ -139,33 +126,33 @@ export async function handleMessage(
   messageText: string,
   messageTs: string,
   channelName: string,
-  channelTopic: string,
+  _channelTopic: string,
   workspaceId: string
 ): Promise<HandleMessageResult> {
-  const classification = await classifyMessage(messageText, channelName, channelTopic);
+  const parsed = parseLogMessage(messageText);
 
-  if (!classification.isAgentActivity || classification.confidence < CONFIDENCE_THRESHOLD) {
+  if (!parsed) {
     return { stored: false };
   }
 
-  const actionType = classification.actionType || "other";
-  const customerContext = classification.customerContext || null;
-  const notes = classification.notes || null;
+  // Determine action type from parsed result
+  const actionType = parsed.answered ? "answer" : (parsed.transfer ? "transfer" : "other");
+  const notes = `Answered: ${parsed.answered ? "Yes" : "No"} | Transfer: ${parsed.transfer ? "Yes" : "No"}`;
 
   await storeActivity({
     workspaceId,
     agentSlackId: userId,
     actionType,
     channelSlackId: channelId,
-    customerContext,
+    customerContext: null,
     notes,
     rawMessage: messageText,
     messageTs,
-    confidence: classification.confidence,
+    confidence: 1.0,
   });
 
   return {
     stored: true,
-    activity: { actionType, customerContext, notes, confidence: classification.confidence },
+    activity: { actionType, customerContext: null, notes, confidence: 1.0 },
   };
 }

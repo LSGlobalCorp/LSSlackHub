@@ -13,8 +13,9 @@ function getOAuth2Client() {
   );
 }
 
-export function getAuthUrl(teamId: string): string {
+export function getAuthUrl(teamId: string, channelId?: string): string {
   const client = getOAuth2Client();
+  const state = channelId ? `${teamId}:${channelId}` : teamId;
   return client.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
@@ -22,7 +23,7 @@ export function getAuthUrl(teamId: string): string {
       "https://www.googleapis.com/auth/spreadsheets",
       "https://www.googleapis.com/auth/drive.file",
     ],
-    state: teamId,
+    state,
   });
 }
 
@@ -57,7 +58,7 @@ export async function handleGoogleCallback(code: string, teamId: string): Promis
           data: [{
             startRow: 0, startColumn: 0,
             rowData: [{
-              values: ["Date", "Time", "Agent Name", "Action Type", "Channel", "Customer Context", "Notes", "Confidence"]
+              values: ["Date", "Time", "Agent ID", "Channel", "Customer ID", "Answered", "Transferred"]
                 .map((h) => ({ userEnteredValue: { stringValue: h }, userEnteredFormat: { textFormat: { bold: true } } })),
             }],
           }],
@@ -87,6 +88,33 @@ export async function handleGoogleCallback(code: string, teamId: string): Promis
   });
 
   const sheetId = spreadsheet.data.spreadsheetId!;
+
+  // Add auto-filters to all tabs
+  const sheetTabs = spreadsheet.data.sheets || [];
+  const filterRequests = sheetTabs.map((tab) => ({
+    setBasicFilter: {
+      filter: {
+        range: {
+          sheetId: tab.properties?.sheetId,
+          startRowIndex: 0,
+          startColumnIndex: 0,
+          endColumnIndex: (tab.properties?.title === "Agent Performance" ? 9
+            : tab.properties?.title === "Activity Log" ? 7 : 7),
+        },
+      },
+    },
+  }));
+
+  try {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: { requests: filterRequests },
+    });
+  } catch (err) {
+    logger.warn("Failed to set auto-filters on sheet", {
+      error: err instanceof Error ? err.message : "Unknown",
+    });
+  }
 
   await query(
     `INSERT INTO google_auth (workspace_id, encrypted_access_token, encrypted_refresh_token, sheet_id, token_expiry)
@@ -146,19 +174,17 @@ async function getAuthenticatedSheetsClient(workspaceId: string) {
 export interface ActivityRowData {
   date: string;
   time: string;
-  agentName: string;
-  actionType: string;
+  agentId: string;
   channelName: string;
-  customerContext: string | null;
-  notes: string | null;
-  confidence: number;
+  customerId: string;
+  answered: number;
+  transferred: number;
 }
 
 export function formatActivityRow(data: ActivityRowData): string[] {
   return [
-    data.date, data.time, data.agentName, data.actionType,
-    data.channelName, data.customerContext || "", data.notes || "",
-    data.confidence.toFixed(2),
+    data.date, data.time, data.agentId, data.channelName,
+    data.customerId, String(data.answered), String(data.transferred),
   ];
 }
 
@@ -197,7 +223,7 @@ export async function flushBuffer(workspaceId?: string): Promise<void> {
 
       await client.sheets.spreadsheets.values.append({
         spreadsheetId: client.sheetId,
-        range: "'Activity Log'!A:H",
+        range: "'Activity Log'!A:G",
         valueInputOption: "USER_ENTERED",
         requestBody: { values: rows },
       });
@@ -235,6 +261,18 @@ export async function writeAgentPerformanceRows(workspaceId: string, rows: strin
     valueInputOption: "USER_ENTERED",
     requestBody: { values: rows },
   });
+}
+
+// --- Set Sheet ID ---
+
+export async function setSheetId(workspaceId: string, sheetId: string): Promise<boolean> {
+  const result = await query(
+    "UPDATE google_auth SET sheet_id = $1, updated_at = NOW() WHERE workspace_id = $2",
+    [sheetId, workspaceId]
+  );
+  if (result.rowCount === 0) return false;
+  logger.info("Sheet ID updated", { workspaceId, sheetId });
+  return true;
 }
 
 // --- Disconnect ---
